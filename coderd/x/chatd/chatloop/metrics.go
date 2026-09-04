@@ -36,6 +36,13 @@ const (
 	// StageAnomalyStaleAnchor is a turn whose trigger timestamp precedes
 	// the anchor of the previous turn; the anchor was clamped.
 	StageAnomalyStaleAnchor = "stale_anchor"
+	// StageAnomalyNonPositiveTurn is a finished turn whose duration
+	// was not positive, so its accounting was not emitted.
+	StageAnomalyNonPositiveTurn = "nonpositive_turn"
+	// StageAnomalyOverattributed is a finished turn whose categories
+	// summed to more than its duration. The categories were emitted as
+	// measured and the turn's shares sum to more than 1.
+	StageAnomalyOverattributed = "overattributed"
 )
 
 // basicStages is the set of stages observed into StageDurationSeconds
@@ -94,6 +101,12 @@ type Metrics struct {
 	StageMetricsLevel         *prometheus.GaugeVec
 	StageDurationSeconds      *prometheus.HistogramVec
 	ModelStageDurationSeconds *prometheus.HistogramVec
+	TurnStageSeconds          *prometheus.HistogramVec
+	TurnTimeSeconds           *prometheus.HistogramVec
+	TurnTimeSecondsTotal      *prometheus.CounterVec
+	TurnsTotal                *prometheus.CounterVec
+	TurnOutcomesTotal         *prometheus.CounterVec
+	TurnTimeShare             *prometheus.HistogramVec
 	StageAnomaliesTotal       *prometheus.CounterVec
 	CompactionTotal           *prometheus.CounterVec
 	StepsTotal                *prometheus.CounterVec
@@ -124,6 +137,12 @@ func NewMetricsWithOptions(reg prometheus.Registerer, opts MetricsOptions) *Metr
 	stageFactory := factory
 	if level == codersdk.ChatStageMetricsLevelOff {
 		stageFactory = promauto.With(nil)
+	}
+	// fullFactory registers the per-turn distribution families exposed
+	// only at full.
+	fullFactory := stageFactory
+	if level != codersdk.ChatStageMetricsLevelFull {
+		fullFactory = promauto.With(nil)
 	}
 	m := &Metrics{
 		stageMetrics: level,
@@ -193,11 +212,50 @@ func NewMetricsWithOptions(reg prometheus.Registerer, opts MetricsOptions) *Metr
 			Help:      "Wall time spent in the chat lifecycle stages that are a provider's work on a model, by provider and model: time_to_first_token, stream, and provider_attempt, plus thinking and compaction at the full stage metrics level. Every observation here is also observed on stage_duration_seconds. The chat_kind and organization_name labels are empty for stages recorded without a known chat.",
 			Buckets:   stageDurationBuckets(level),
 		}, []string{"stage", "provider", "chat_kind", "organization_name", "model"}),
+		TurnStageSeconds: fullFactory.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "turn_stage_seconds",
+			Help:      "Total wall time one chat turn spent in a stage, observed once per turn when the turn ends. Stages overlap, so these do not partition the turn. Only turns that finished normally are counted. Registered only at the full stage metrics level.",
+			Buckets:   turnDurationBuckets(),
+		}, []string{"stage", "chat_kind", "organization_name"}),
+		TurnTimeSeconds: fullFactory.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "turn_time_seconds",
+			Help:      "Wall time of one chat turn split into disjoint categories that sum to the turn duration, observed once per turn per category when the turn ends. Every category is observed, including the ones with no time. Only turns that finished normally are counted. Registered only at the full stage metrics level.",
+			Buckets:   turnDurationBuckets(),
+		}, []string{"category", "chat_kind", "organization_name"}),
+		TurnTimeSecondsTotal: stageFactory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "turn_time_seconds_total",
+			Help:      "Accumulated wall time of finished chat turns split into disjoint categories that sum to the turn duration, added once per turn per category when the turn ends. Divide by turns_total for mean seconds per turn. Only turns that finished normally are counted.",
+		}, []string{"category", "chat_kind", "organization_name"}),
+		TurnsTotal: stageFactory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "turns_total",
+			Help:      "Total chat turns whose time partition was recorded in turn_time_seconds_total. Only turns that finished normally are counted.",
+		}, []string{"chat_kind", "organization_name"}),
+		TurnOutcomesTotal: stageFactory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "turn_outcomes_total",
+			Help:      "Total chat turns by outcome (completed, interrupted, error, abandoned); every closed turn is counted exactly once, and completed turns are the ones whose time partition is recorded.",
+		}, []string{"outcome", "chat_kind", "organization_name"}),
+		TurnTimeShare: fullFactory.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "turn_time_share",
+			Help:      "Fraction of a chat turn's wall time in each disjoint category, observed once per turn per category when the turn ends. The shares of one turn sum to 1. Only turns that finished normally are counted. Registered only at the full stage metrics level.",
+			Buckets:   turnShareBuckets(),
+		}, []string{"category", "chat_kind", "organization_name"}),
 		StageAnomaliesTotal: stageFactory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "stage_anomalies_total",
-			Help:      "Chat lifecycle stage observations dropped or adjusted by reason. Reasons: negative_elapsed and inverted_window (clock inconsistencies), stale_anchor (turn anchor clamped to the previous turn close).",
+			Help:      "Chat lifecycle stage observations dropped, adjusted, or emitted with a known inconsistency, by reason. Reasons: negative_elapsed and inverted_window (clock inconsistencies), stale_anchor (turn anchor clamped to the previous turn's anchor), nonpositive_turn (finished turn whose accounting was not emitted), overattributed (turn whose categories summed to more than its duration).",
 		}, []string{"reason"}),
 		CompactionTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -266,6 +324,19 @@ func stageDurationBuckets(level codersdk.ChatStageMetricsLevel) []float64 {
 	return []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 1800, 3600}
 }
 
+// turnDurationBuckets returns the duration buckets for histograms of
+// per-turn sums: 1s to 1h. Sub-second resolution carries no
+// information for a value summed over a whole turn.
+func turnDurationBuckets() []float64 {
+	return []float64{1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800, 3600}
+}
+
+// turnShareBuckets returns the buckets for the category share
+// histogram, whose values partition a turn: 0 to 1 in twentieths.
+func turnShareBuckets() []float64 {
+	return prometheus.LinearBuckets(0, 0.05, 21)
+}
+
 // NopMetrics returns a Metrics instance that discards all data.
 // Useful for tests and when metrics collection is not desired.
 func NopMetrics() *Metrics {
@@ -307,13 +378,54 @@ func (m *Metrics) RecordStageDuration(stage, scope, chatKind, organization strin
 	}
 }
 
-// RecordStageAnomaly counts a stage observation that was dropped, by
-// reason. No-op when m is nil.
+// RecordStageAnomaly counts a stage observation that was dropped or
+// emitted inconsistent, by reason. No-op when m is nil.
 func (m *Metrics) RecordStageAnomaly(reason string) {
 	if m == nil {
 		return
 	}
 	m.StageAnomaliesTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordTurnStage observes the total time one turn spent in a stage.
+// No-op when m is nil.
+func (m *Metrics) RecordTurnStage(stage, chatKind, organization string, elapsed time.Duration) {
+	if m == nil || elapsed < 0 {
+		return
+	}
+	m.TurnStageSeconds.WithLabelValues(stage, chatKind, organization).Observe(elapsed.Seconds())
+}
+
+// RecordTurnCategory records one category of a turn's time partition:
+// it adds the elapsed time to the category counter and observes the
+// elapsed time and its fraction of the turn on the per-turn histograms.
+// Categories with no time are recorded as zero so the shares of a turn
+// always sum to 1. No-op when m is nil.
+func (m *Metrics) RecordTurnCategory(category, chatKind, organization string, elapsed time.Duration, share float64) {
+	if m == nil || elapsed < 0 {
+		return
+	}
+	m.TurnTimeSecondsTotal.WithLabelValues(category, chatKind, organization).Add(elapsed.Seconds())
+	m.TurnTimeSeconds.WithLabelValues(category, chatKind, organization).Observe(elapsed.Seconds())
+	m.TurnTimeShare.WithLabelValues(category, chatKind, organization).Observe(share)
+}
+
+// RecordTurn counts one finished turn whose time partition was
+// recorded through RecordTurnCategory. No-op when m is nil.
+func (m *Metrics) RecordTurn(chatKind, organization string) {
+	if m == nil {
+		return
+	}
+	m.TurnsTotal.WithLabelValues(chatKind, organization).Inc()
+}
+
+// RecordTurnOutcome counts one closed turn by outcome. No-op when m is
+// nil.
+func (m *Metrics) RecordTurnOutcome(outcome, chatKind, organization string) {
+	if m == nil {
+		return
+	}
+	m.TurnOutcomesTotal.WithLabelValues(outcome, chatKind, organization).Inc()
 }
 
 // RecordCompaction classifies and records a compaction attempt.
