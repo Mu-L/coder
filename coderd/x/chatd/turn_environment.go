@@ -438,6 +438,7 @@ func buildTurnEnvironment(
 		if err != nil {
 			return xerrors.Errorf("build chat prompt: %w", err)
 		}
+		prompt = replaceUnsupportedToolMedia(ctx, logger, prompt, model, providerType)
 		if pendingRowsStart < len(promptRows) {
 			pendingPrompt, err = chatprompt.ConvertMessagesWithFiles(ctx, promptRows[pendingRowsStart:], server.chatFileResolver(providerType), logger, acceptsFilePart)
 			if err != nil {
@@ -773,6 +774,7 @@ func buildTurnEnvironment(
 		builtinToolNames[chattool.FindToolsName] = true
 	}
 
+	toolDefinitions := chatloop.BuildToolDefinitions(tools, activeToolNames, providerTools)
 	toolNameToConfigID := make(map[string]uuid.UUID)
 	for _, t := range tools {
 		if mcpTool, ok := t.(mcpclient.MCPToolIdentifier); ok {
@@ -820,6 +822,7 @@ func buildTurnEnvironment(
 		ModelConfigID:        modelConfig.ID,
 		StepUsage:            compactionStepUsage,
 		SummaryCall:          compactionSummaryCall(resolved),
+		ToolDefinitions:      toolDefinitions,
 	}
 
 	// workspaceCtx.currentChatSnapshot may carry a freshly persisted
